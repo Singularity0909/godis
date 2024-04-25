@@ -7,14 +7,16 @@ package tcp
 import (
 	"context"
 	"fmt"
-	"github.com/hdt3213/godis/interface/tcp"
-	"github.com/hdt3213/godis/lib/logger"
 	"net"
 	"os"
 	"os/signal"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
+
+	"github.com/hdt3213/godis/interface/tcp"
+	"github.com/hdt3213/godis/lib/logger"
 )
 
 // Config stores tcp server properties
@@ -23,6 +25,9 @@ type Config struct {
 	MaxConnect uint32        `yaml:"max-connect"`
 	Timeout    time.Duration `yaml:"timeout"`
 }
+
+// ClientCounter Record the number of clients in the current Godis server
+var ClientCounter int32
 
 // ListenAndServeWithSignal binds port and handle requests, blocking until receive stop signal
 func ListenAndServeWithSignal(cfg *Config, handler tcp.Handler) error {
@@ -49,32 +54,42 @@ func ListenAndServeWithSignal(cfg *Config, handler tcp.Handler) error {
 // ListenAndServe binds port and handle requests, blocking until close
 func ListenAndServe(listener net.Listener, handler tcp.Handler, closeChan <-chan struct{}) {
 	// listen signal
+	errCh := make(chan error, 1)
+	defer close(errCh)
 	go func() {
-		<-closeChan
+		select {
+		case <-closeChan:
+			logger.Info("get exit signal")
+		case er := <-errCh:
+			logger.Info(fmt.Sprintf("accept error: %s", er.Error()))
+		}
 		logger.Info("shutting down...")
 		_ = listener.Close() // listener.Accept() will return err immediately
 		_ = handler.Close()  // close connections
 	}()
 
-	// listen port
-	defer func() {
-		// close during unexpected error
-		_ = listener.Close()
-		_ = handler.Close()
-	}()
 	ctx := context.Background()
 	var waitDone sync.WaitGroup
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
+			// learn from net/http/serve.go#Serve()
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				logger.Infof("accept occurs temporary error: %v, retry in 5ms", err)
+				time.Sleep(5 * time.Millisecond)
+				continue
+			}
+			errCh <- err
 			break
 		}
 		// handle
 		logger.Info("accept link")
+		ClientCounter++
 		waitDone.Add(1)
 		go func() {
 			defer func() {
 				waitDone.Done()
+				atomic.AddInt32(&ClientCounter, -1)
 			}()
 			handler.Handle(ctx, conn)
 		}()

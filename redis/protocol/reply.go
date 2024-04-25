@@ -7,7 +7,6 @@ import (
 )
 
 var (
-	nullBulkReplyBytes = []byte("$-1")
 
 	// CRLF is the line separator of redis serialization protocol
 	CRLF = "\r\n"
@@ -29,8 +28,8 @@ func MakeBulkReply(arg []byte) *BulkReply {
 
 // ToBytes marshal redis.Reply
 func (r *BulkReply) ToBytes() []byte {
-	if len(r.Arg) == 0 {
-		return nullBulkReplyBytes
+	if r.Arg == nil {
+		return nullBulkBytes
 	}
 	return []byte("$" + strconv.Itoa(len(r.Arg)) + CRLF + string(r.Arg) + CRLF)
 }
@@ -51,14 +50,34 @@ func MakeMultiBulkReply(args [][]byte) *MultiBulkReply {
 
 // ToBytes marshal redis.Reply
 func (r *MultiBulkReply) ToBytes() []byte {
-	argLen := len(r.Args)
 	var buf bytes.Buffer
-	buf.WriteString("*" + strconv.Itoa(argLen) + CRLF)
+	//Calculate the length of buffer
+	argLen := len(r.Args)
+	bufLen := 1 + len(strconv.Itoa(argLen)) + 2
 	for _, arg := range r.Args {
 		if arg == nil {
-			buf.WriteString("$-1" + CRLF)
+			bufLen += 3 + 2
 		} else {
-			buf.WriteString("$" + strconv.Itoa(len(arg)) + CRLF + string(arg) + CRLF)
+			bufLen += 1 + len(strconv.Itoa(len(arg))) + 2 + len(arg) + 2
+		}
+	}
+	//Allocate memory
+	buf.Grow(bufLen)
+	//Write string step by step,avoid concat strings
+	buf.WriteString("*")
+	buf.WriteString(strconv.Itoa(argLen))
+	buf.WriteString(CRLF)
+	for _, arg := range r.Args {
+		if arg == nil {
+			buf.WriteString("$-1")
+			buf.WriteString(CRLF)
+		} else {
+			buf.WriteString("$")
+			buf.WriteString(strconv.Itoa(len(arg)))
+			buf.WriteString(CRLF)
+			//Write bytes,avoid slice of byte to string(slicebytetostring)
+			buf.Write(arg)
+			buf.WriteString(CRLF)
 		}
 	}
 	return buf.Bytes()
@@ -106,6 +125,11 @@ func MakeStatusReply(status string) *StatusReply {
 // ToBytes marshal redis.Reply
 func (r *StatusReply) ToBytes() []byte {
 	return []byte("+" + r.Status + CRLF)
+}
+
+// IsOKReply returns true if the given protocol is +OK
+func IsOKReply(reply redis.Reply) bool {
+	return string(reply.ToBytes()) == "+OK\r\n"
 }
 
 /* ---- Int Reply ---- */

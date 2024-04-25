@@ -2,13 +2,14 @@ package database
 
 import (
 	"fmt"
+	"strconv"
+	"strings"
+
 	"github.com/hdt3213/godis/datastruct/sortedset"
 	"github.com/hdt3213/godis/interface/redis"
 	"github.com/hdt3213/godis/lib/geohash"
 	"github.com/hdt3213/godis/lib/utils"
 	"github.com/hdt3213/godis/redis/protocol"
-	"strconv"
-	"strings"
 )
 
 // execGeoAdd add a location into SortedSet
@@ -253,7 +254,7 @@ func geoRadius0(sortedSet *sortedset.SortedSet, lat float64, lng float64, radius
 	for _, area := range areas {
 		lower := &sortedset.ScoreBorder{Value: float64(area[0])}
 		upper := &sortedset.ScoreBorder{Value: float64(area[1])}
-		elements := sortedSet.RangeByScore(lower, upper, 0, -1, true)
+		elements := sortedSet.Range(lower, upper, 0, -1, true)
 		for _, elem := range elements {
 			members = append(members, []byte(elem.Member))
 		}
@@ -262,10 +263,16 @@ func geoRadius0(sortedSet *sortedset.SortedSet, lat float64, lng float64, radius
 }
 
 func init() {
-	RegisterCommand("GeoAdd", execGeoAdd, writeFirstKey, undoGeoAdd, -5)
-	RegisterCommand("GeoPos", execGeoPos, readFirstKey, nil, -2)
-	RegisterCommand("GeoDist", execGeoDist, readFirstKey, nil, -4)
-	RegisterCommand("GeoHash", execGeoHash, readFirstKey, nil, -2)
-	RegisterCommand("GeoRadius", execGeoRadius, readFirstKey, nil, -6)
-	RegisterCommand("GeoRadiusByMember", execGeoRadiusByMember, readFirstKey, nil, -5)
+	registerCommand("GeoAdd", execGeoAdd, writeFirstKey, undoGeoAdd, -5, flagWrite).
+		attachCommandExtra([]string{redisFlagWrite, redisFlagDenyOOM}, 1, 1, 1)
+	registerCommand("GeoPos", execGeoPos, readFirstKey, nil, -2, flagReadOnly).
+		attachCommandExtra([]string{redisFlagReadonly}, 1, 1, 1)
+	registerCommand("GeoDist", execGeoDist, readFirstKey, nil, -4, flagReadOnly).
+		attachCommandExtra([]string{redisFlagReadonly}, 1, 1, 1)
+	registerCommand("GeoHash", execGeoHash, readFirstKey, nil, -2, flagReadOnly).
+		attachCommandExtra([]string{redisFlagReadonly}, 1, 1, 1)
+	registerCommand("GeoRadius", execGeoRadius, readFirstKey, nil, -6, flagReadOnly).
+		attachCommandExtra([]string{redisFlagWrite, redisFlagMovableKeys}, 1, 1, 1)
+	registerCommand("GeoRadiusByMember", execGeoRadiusByMember, readFirstKey, nil, -5, flagReadOnly).
+		attachCommandExtra([]string{redisFlagWrite, redisFlagMovableKeys}, 1, 1, 1)
 }

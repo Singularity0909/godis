@@ -1,10 +1,14 @@
 package client
 
 import (
+	"bytes"
 	"github.com/hdt3213/godis/lib/logger"
+	"github.com/hdt3213/godis/lib/utils"
 	"github.com/hdt3213/godis/redis/protocol"
+	"github.com/hdt3213/godis/redis/protocol/asserts"
 	"strconv"
 	"testing"
+	"time"
 )
 
 func TestClient(t *testing.T) {
@@ -103,4 +107,36 @@ func TestClient(t *testing.T) {
 	}
 
 	client.Close()
+	ret := client.Send(utils.ToCmdLine("ping"))
+	asserts.AssertErrReply(t, ret, "client closed")
+}
+
+func TestReconnect(t *testing.T) {
+	logger.Setup(&logger.Settings{
+		Path:       "logs",
+		Name:       "godis",
+		Ext:        ".log",
+		TimeFormat: "2006-01-02",
+	})
+	client, err := MakeClient("localhost:6379")
+	if err != nil {
+		t.Error(err)
+	}
+	client.Start()
+
+	_ = client.conn.Close()
+	time.Sleep(time.Second) // wait for reconnecting
+	success := false
+	for i := 0; i < 3; i++ {
+		result := client.Send([][]byte{
+			[]byte("PING"),
+		})
+		if bytes.Equal(result.ToBytes(), []byte("+PONG\r\n")) {
+			success = true
+			break
+		}
+	}
+	if !success {
+		t.Error("reconnect error")
+	}
 }

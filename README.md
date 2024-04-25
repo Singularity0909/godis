@@ -1,7 +1,7 @@
 # Godis
 
 ![license](https://img.shields.io/github/license/HDT3213/godis)
-[![Build Status](https://travis-ci.com/HDT3213/godis.svg?branch=master)](https://app.travis-ci.com/github/HDT3213/godis)
+[![Build Status](https://github.com/hdt3213/godis/actions/workflows/coverall.yml/badge.svg)](https://github.com/HDT3213/godis/actions?query=branch%3Amaster)
 [![Coverage Status](https://coveralls.io/repos/github/HDT3213/godis/badge.svg?branch=master)](https://coveralls.io/github/HDT3213/godis?branch=master)
 [![Go Report Card](https://goreportcard.com/badge/github.com/HDT3213/godis)](https://goreportcard.com/report/github.com/HDT3213/godis)
 [![Go Reference](https://pkg.go.dev/badge/github.com/hdt3213/godis.svg)](https://pkg.go.dev/github.com/hdt3213/godis)
@@ -15,15 +15,19 @@ middleware using golang.
 
 Key Features:
 
-- Support string, list, hash, set, sorted set
-- Multi Database and `SELECT` command  
+- Support string, list, hash, set, sorted set, bitmap
+- Multi Database and `SELECT` command
 - TTL
 - Publish/Subscribe
 - GEO
 - AOF and AOF Rewrite
-- MULTI Commands Transaction is Atomic and Isolated. If any errors are encountered during execution, godis will rollback the executed commands
+- RDB read and write
+- MULTI Commands Transaction is Atomic and Isolated. If any errors are encountered during execution, godis will rollback
+  the executed commands
+- Replication (experimental)
 - Server-side Cluster which is transparent to client. You can connect to any node in the cluster to
   access all data in the cluster.
+  - Use the raft algorithm to maintain cluster metadata. (experimental)
   - `MSET`, `MSETNX`, `DEL`, `Rename`, `RenameNX` command is supported and atomically executed in cluster mode, allow over multi node
   - `MULTI` Commands Transaction is supported within slot in cluster mode
 - Concurrent Core, so you don't have to worry about your commands blocking the server too much. 
@@ -81,7 +85,7 @@ See: [commands.md](https://github.com/HDT3213/godis/blob/master/commands.md)
 
 Environment:
 
-Go version：1.16
+Go version：1.17
 
 System: macOS Catalina 10.15.7
 
@@ -117,7 +121,7 @@ MSET (10 keys): 65487.89 requests per second
 + [x] `Multi` Command
 + [x] `Watch` Command and CAS support
 + [ ] Stream support
-+ [ ] RDB file loader
++ [x] RDB file loader
 + [ ] Master-Slave mode
 + [ ] Sentinel
 
@@ -141,8 +145,8 @@ I suggest focusing on the following directories:
     - set: a hash set based on map
     - sortedset: a sorted set implements based on skiplist
 - database: the core of storage engine
-    - database.go: a standalone redis server, with multiple database 
-    - single_db.go: data structure and base functions of single database
+    - server.go: a standalone redis server, with multiple database
+    - database.go: data structure and base functions of single database
     - exec.go: the gateway of database
     - router.go: the command table
     - keys.go: handlers for keys commands

@@ -1,7 +1,6 @@
 package database
 
 import (
-	"fmt"
 	"github.com/hdt3213/godis/lib/utils"
 	"github.com/hdt3213/godis/redis/protocol"
 	"github.com/hdt3213/godis/redis/protocol/asserts"
@@ -37,11 +36,11 @@ func TestSAdd(t *testing.T) {
 	result = testDB.Exec(nil, utils.ToCmdLine("SMembers", key))
 	multiBulk, ok := result.(*protocol.MultiBulkReply)
 	if !ok {
-		t.Error(fmt.Sprintf("expected bulk protocol, actually %s", result.ToBytes()))
+		t.Errorf("expected bulk protocol, actually %s", result.ToBytes())
 		return
 	}
 	if len(multiBulk.Args) != size {
-		t.Error(fmt.Sprintf("expected %d elements, actually %d", size, len(multiBulk.Args)))
+		t.Errorf("expected %d elements, actually %d", size, len(multiBulk.Args))
 		return
 	}
 }
@@ -84,7 +83,7 @@ func TestSPop(t *testing.T) {
 		resultSpop := testDB.Exec(nil, utils.ToCmdLine("spop", key, strconv.FormatInt(int64(count), 10)))
 		multiBulk, ok := resultSpop.(*protocol.MultiBulkReply)
 		if !ok {
-			t.Error(fmt.Sprintf("expected bulk protocol, actually %s", resultSpop.ToBytes()))
+			t.Errorf("expected bulk protocol, actually %s", resultSpop.ToBytes())
 			return
 		}
 		removedSize := len(multiBulk.Args)
@@ -106,7 +105,7 @@ func TestSInter(t *testing.T) {
 	keys := make([]string, 0)
 	start := 0
 	for i := 0; i < 4; i++ {
-		key := utils.RandString(10)
+		key := utils.RandString(10) + strconv.Itoa(i)
 		keys = append(keys, key)
 		for j := start; j < size+start; j++ {
 			member := strconv.Itoa(j)
@@ -130,7 +129,7 @@ func TestSInter(t *testing.T) {
 	key1 := utils.RandString(10)
 	testDB.Exec(nil, utils.ToCmdLine("sadd", key1, "a", "b"))
 	key2 := utils.RandString(10)
-	testDB.Exec(nil, utils.ToCmdLine("sadd", key1, "1", "2"))
+	testDB.Exec(nil, utils.ToCmdLine("sadd", key2, "1", "2"))
 	result = testDB.Exec(nil, utils.ToCmdLine("sinter", key0, key1, key2))
 	asserts.AssertMultiBulkReplySize(t, result, 0)
 	result = testDB.Exec(nil, utils.ToCmdLine("sinter", key1, key2))
@@ -220,7 +219,7 @@ func TestSRandMember(t *testing.T) {
 	result := testDB.Exec(nil, utils.ToCmdLine("SRandMember", key))
 	br, ok := result.(*protocol.BulkReply)
 	if !ok && len(br.Arg) > 0 {
-		t.Error(fmt.Sprintf("expected bulk protocol, actually %s", result.ToBytes()))
+		t.Errorf("expected bulk protocol, actually %s", result.ToBytes())
 		return
 	}
 
@@ -228,7 +227,7 @@ func TestSRandMember(t *testing.T) {
 	asserts.AssertMultiBulkReplySize(t, result, 10)
 	multiBulk, ok := result.(*protocol.MultiBulkReply)
 	if !ok {
-		t.Error(fmt.Sprintf("expected bulk protocol, actually %s", result.ToBytes()))
+		t.Errorf("expected bulk protocol, actually %s", result.ToBytes())
 		return
 	}
 	m := make(map[string]struct{})
@@ -236,7 +235,7 @@ func TestSRandMember(t *testing.T) {
 		m[string(arg)] = struct{}{}
 	}
 	if len(m) != 10 {
-		t.Error(fmt.Sprintf("expected 10 members, actually %d", len(m)))
+		t.Errorf("expected 10 members, actually %d", len(m))
 		return
 	}
 

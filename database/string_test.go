@@ -5,6 +5,7 @@ import (
 	"github.com/hdt3213/godis/lib/utils"
 	"github.com/hdt3213/godis/redis/protocol"
 	"github.com/hdt3213/godis/redis/protocol/asserts"
+	"math"
 	"strconv"
 	"testing"
 )
@@ -22,6 +23,20 @@ func TestSet2(t *testing.T) {
 		if !utils.BytesEquals(actual.ToBytes(), expected.ToBytes()) {
 			t.Error("expected: " + string(expected.ToBytes()) + ", actual: " + string(actual.ToBytes()))
 		}
+	}
+}
+
+func TestSetEmpty(t *testing.T) {
+	key := utils.RandString(10)
+	testDB.Exec(nil, utils.ToCmdLine("SET", key, ""))
+	actual := testDB.Exec(nil, utils.ToCmdLine("GET", key))
+	bulkReply, ok := actual.(*protocol.BulkReply)
+	if !ok {
+		t.Errorf("expected bulk protocol, actually %s", actual.ToBytes())
+		return
+	}
+	if !(bulkReply.Arg != nil && len(bulkReply.Arg) == 0) {
+		t.Error("illegal empty string")
 	}
 }
 
@@ -79,11 +94,11 @@ func TestSet(t *testing.T) {
 	actual = testDB.Exec(nil, utils.ToCmdLine("TTL", key))
 	intResult, ok := actual.(*protocol.IntReply)
 	if !ok {
-		t.Error(fmt.Sprintf("expected int protocol, actually %s", actual.ToBytes()))
+		t.Errorf("expected int protocol, actually %s", actual.ToBytes())
 		return
 	}
 	if intResult.Code <= 0 || intResult.Code > 1000 {
-		t.Error(fmt.Sprintf("expected int between [0, 1000], actually %d", intResult.Code))
+		t.Errorf("expected int between [0, 1000], actually %d", intResult.Code)
 		return
 	}
 
@@ -96,11 +111,11 @@ func TestSet(t *testing.T) {
 	actual = testDB.Exec(nil, utils.ToCmdLine("TTL", key))
 	intResult, ok = actual.(*protocol.IntReply)
 	if !ok {
-		t.Error(fmt.Sprintf("expected int protocol, actually %s", actual.ToBytes()))
+		t.Errorf("expected int protocol, actually %s", actual.ToBytes())
 		return
 	}
 	if intResult.Code <= 0 || intResult.Code > 1000 {
-		t.Error(fmt.Sprintf("expected int between [0, 1000], actually %d", intResult.Code))
+		t.Errorf("expected int between [0, 1000], actually %d", intResult.Code)
 		return
 	}
 }
@@ -135,11 +150,11 @@ func TestSetEX(t *testing.T) {
 	actual = testDB.Exec(nil, utils.ToCmdLine("TTL", key))
 	intResult, ok := actual.(*protocol.IntReply)
 	if !ok {
-		t.Error(fmt.Sprintf("expected int protocol, actually %s", actual.ToBytes()))
+		t.Errorf("expected int protocol, actually %s", actual.ToBytes())
 		return
 	}
 	if intResult.Code <= 0 || intResult.Code > 1000 {
-		t.Error(fmt.Sprintf("expected int between [0, 1000], actually %d", intResult.Code))
+		t.Errorf("expected int between [0, 1000], actually %d", intResult.Code)
 		return
 	}
 }
@@ -156,11 +171,11 @@ func TestPSetEX(t *testing.T) {
 	actual = testDB.Exec(nil, utils.ToCmdLine("PTTL", key))
 	intResult, ok := actual.(*protocol.IntReply)
 	if !ok {
-		t.Error(fmt.Sprintf("expected int protocol, actually %s", actual.ToBytes()))
+		t.Errorf("expected int protocol, actually %s", actual.ToBytes())
 		return
 	}
 	if intResult.Code <= 0 || intResult.Code > 1000000 {
-		t.Error(fmt.Sprintf("expected int between [0, 1000], actually %d", intResult.Code))
+		t.Errorf("expected int between [0, 1000], actually %d", intResult.Code)
 		return
 	}
 }
@@ -237,7 +252,7 @@ func TestIncr(t *testing.T) {
 		expected := -i - 1
 		bulk, ok := actual.(*protocol.BulkReply)
 		if !ok {
-			t.Error(fmt.Sprintf("expected bulk protocol, actually %s", actual.ToBytes()))
+			t.Errorf("expected bulk protocol, actually %s", actual.ToBytes())
 			return
 		}
 		val, err := strconv.ParseFloat(string(bulk.Arg), 10)
@@ -245,7 +260,7 @@ func TestIncr(t *testing.T) {
 			t.Error(err)
 			return
 		}
-		if int(val) != expected {
+		if math.Abs(val-float64(expected)) > 1e-4 {
 			t.Errorf("expect %d, actual: %d", expected, int(val))
 			return
 		}
@@ -268,7 +283,7 @@ func TestDecr(t *testing.T) {
 		expected := -i - 1
 		bulk, ok := actual.(*protocol.BulkReply)
 		if !ok {
-			t.Error(fmt.Sprintf("expected bulk protocol, actually %s", actual.ToBytes()))
+			t.Errorf("expected bulk protocol, actually %s", actual.ToBytes())
 			return
 		}
 		val, err := strconv.ParseFloat(string(bulk.Arg), 10)
@@ -280,6 +295,62 @@ func TestDecr(t *testing.T) {
 			t.Errorf("expect %d, actual: %d", expected, int(val))
 			return
 		}
+	}
+}
+
+func TestGetEX(t *testing.T) {
+	testDB.Flush()
+	key := utils.RandString(10)
+	value := utils.RandString(10)
+	ttl := "1000"
+
+	testDB.Exec(nil, utils.ToCmdLine("SET", key, value))
+
+	// Normal Get
+	actual := testDB.Exec(nil, utils.ToCmdLine("GETEX", key))
+	asserts.AssertBulkReply(t, actual, value)
+
+	// Test GetEX Key EX Seconds
+	actual = testDB.Exec(nil, utils.ToCmdLine("GETEX", key, "EX", ttl))
+	asserts.AssertBulkReply(t, actual, value)
+	actual = testDB.Exec(nil, utils.ToCmdLine("TTL", key))
+	intResult, ok := actual.(*protocol.IntReply)
+	if !ok {
+		t.Errorf("expected int protocol, actually %s", actual.ToBytes())
+		return
+	}
+	if intResult.Code <= 0 || intResult.Code > 1000 {
+		t.Errorf("expected int between [0, 1000], actually %d", intResult.Code)
+		return
+	}
+
+	// Test GetEX Key Persist
+	actual = testDB.Exec(nil, utils.ToCmdLine("GETEX", key, "PERSIST"))
+	asserts.AssertBulkReply(t, actual, value)
+	actual = testDB.Exec(nil, utils.ToCmdLine("TTL", key))
+	intResult, ok = actual.(*protocol.IntReply)
+	if !ok {
+		t.Errorf("expected int protocol, actually %s", actual.ToBytes())
+		return
+	}
+	if intResult.Code != -1 {
+		t.Errorf("expected int equals -1, actually %d", intResult.Code)
+		return
+	}
+
+	// Test GetEX Key NX Milliseconds
+	ttl = "1000000"
+	actual = testDB.Exec(nil, utils.ToCmdLine("GETEX", key, "PX", ttl))
+	asserts.AssertBulkReply(t, actual, value)
+	actual = testDB.Exec(nil, utils.ToCmdLine("TTL", key))
+	intResult, ok = actual.(*protocol.IntReply)
+	if !ok {
+		t.Errorf("expected int protocol, actually %s", actual.ToBytes())
+		return
+	}
+	if intResult.Code <= 0 || intResult.Code > 1000000 {
+		t.Errorf("expected int between [0, 1000000], actually %d", intResult.Code)
+		return
 	}
 }
 
@@ -300,6 +371,17 @@ func TestGetSet(t *testing.T) {
 	asserts.AssertBulkReply(t, actual, value)
 	actual = testDB.Exec(nil, utils.ToCmdLine("GET", key))
 	asserts.AssertBulkReply(t, actual, value2)
+
+	// Test GetDel
+	actual = testDB.Exec(nil, utils.ToCmdLine("GETDEL", key))
+	asserts.AssertBulkReply(t, actual, value2)
+
+	actual = testDB.Exec(nil, utils.ToCmdLine("GETDEL", key))
+	_, ok = actual.(*protocol.NullBulkReply)
+	if !ok {
+		t.Errorf("expect null bulk protocol, get: %s", string(actual.ToBytes()))
+		return
+	}
 }
 
 func TestMSetNX(t *testing.T) {
@@ -720,4 +802,14 @@ func TestBitPos(t *testing.T) {
 	asserts.AssertErrReply(t, actual, "ERR value is not an integer or out of range")
 	actual = testDB.Exec(nil, utils.ToCmdLine("BitPos", key, "-1"))
 	asserts.AssertErrReply(t, actual, "ERR bit is not an integer or out of range")
+}
+
+func TestRandomkey(t *testing.T) {
+	testDB.Flush()
+	for i := 0; i < 10; i++ {
+		key := utils.RandString(10)
+		testDB.Exec(nil, utils.ToCmdLine2("SET", key, key))
+	}
+	actual := testDB.Exec(nil, utils.ToCmdLine("Randomkey"))
+	asserts.AssertNotError(t, actual)
 }

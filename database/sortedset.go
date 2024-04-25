@@ -1,13 +1,15 @@
 package database
 
 import (
+	"math"
+	"strconv"
+	"strings"
+
 	SortedSet "github.com/hdt3213/godis/datastruct/sortedset"
 	"github.com/hdt3213/godis/interface/database"
 	"github.com/hdt3213/godis/interface/redis"
 	"github.com/hdt3213/godis/lib/utils"
 	"github.com/hdt3213/godis/redis/protocol"
-	"strconv"
-	"strings"
 )
 
 func (db *DB) getAsSortedSet(key string) (*SortedSet.SortedSet, protocol.ErrorReply) {
@@ -253,7 +255,7 @@ func range0(db *DB, key string, start int64, stop int64, withScores bool, desc b
 	}
 
 	// assert: start in [0, size - 1], stop in [start, size]
-	slice := sortedSet.Range(start, stop, desc)
+	slice := sortedSet.RangeByRank(start, stop, desc)
 	if withScores {
 		result := make([][]byte, len(slice)*2)
 		i := 0
@@ -298,13 +300,13 @@ func execZCount(db *DB, args [][]byte) redis.Reply {
 		return protocol.MakeIntReply(0)
 	}
 
-	return protocol.MakeIntReply(sortedSet.Count(min, max))
+	return protocol.MakeIntReply(sortedSet.RangeCount(min, max))
 }
 
 /*
  * param limit: limit < 0 means no limit
  */
-func rangeByScore0(db *DB, key string, min *SortedSet.ScoreBorder, max *SortedSet.ScoreBorder, offset int64, limit int64, withScores bool, desc bool) redis.Reply {
+func rangeByScore0(db *DB, key string, min SortedSet.Border, max SortedSet.Border, offset int64, limit int64, withScores bool, desc bool) redis.Reply {
 	// get data
 	sortedSet, errReply := db.getAsSortedSet(key)
 	if errReply != nil {
@@ -314,7 +316,7 @@ func rangeByScore0(db *DB, key string, min *SortedSet.ScoreBorder, max *SortedSe
 		return &protocol.EmptyMultiBulkReply{}
 	}
 
-	slice := sortedSet.RangeByScore(min, max, offset, limit, desc)
+	slice := sortedSet.Range(min, max, offset, limit, desc)
 	if withScores {
 		result := make([][]byte, len(slice)*2)
 		i := 0
@@ -456,7 +458,7 @@ func execZRemRangeByScore(db *DB, args [][]byte) redis.Reply {
 		return &protocol.EmptyMultiBulkReply{}
 	}
 
-	removed := sortedSet.RemoveByScore(min, max)
+	removed := sortedSet.RemoveRange(min, max)
 	if removed > 0 {
 		db.addAof(utils.ToCmdLine3("zremrangebyscore", args...))
 	}
@@ -512,6 +514,37 @@ func execZRemRangeByRank(db *DB, args [][]byte) redis.Reply {
 		db.addAof(utils.ToCmdLine3("zremrangebyrank", args...))
 	}
 	return protocol.MakeIntReply(removed)
+}
+
+func execZPopMin(db *DB, args [][]byte) redis.Reply {
+	key := string(args[0])
+	count := 1
+	if len(args) > 1 {
+		var err error
+		count, err = strconv.Atoi(string(args[1]))
+		if err != nil {
+			return protocol.MakeErrReply("ERR value is not an integer or out of range")
+		}
+	}
+
+	sortedSet, errReply := db.getAsSortedSet(key)
+	if errReply != nil {
+		return errReply
+	}
+	if sortedSet == nil {
+		return protocol.MakeEmptyMultiBulkReply()
+	}
+
+	removed := sortedSet.PopMin(count)
+	if len(removed) > 0 {
+		db.addAof(utils.ToCmdLine3("zpopmin", args...))
+	}
+	result := make([][]byte, 0, len(removed)*2)
+	for _, element := range removed {
+		scoreStr := strconv.FormatFloat(element.Score, 'f', -1, 64)
+		result = append(result, []byte(element.Member), []byte(scoreStr))
+	}
+	return protocol.MakeMultiBulkReply(result)
 }
 
 // execZRem removes given members
@@ -590,21 +623,216 @@ func undoZIncr(db *DB, args [][]byte) []CmdLine {
 	return rollbackZSetFields(db, key, field)
 }
 
+func execZLexCount(db *DB, args [][]byte) redis.Reply {
+	key := string(args[0])
+	sortedSet, errReply := db.getAsSortedSet(key)
+	if errReply != nil {
+		return errReply
+	}
+	if sortedSet == nil {
+		return protocol.MakeIntReply(0)
+	}
+
+	minEle, maxEle := string(args[1]), string(args[2])
+	min, err := SortedSet.ParseLexBorder(minEle)
+	if err != nil {
+		return protocol.MakeErrReply(err.Error())
+	}
+	max, err := SortedSet.ParseLexBorder(maxEle)
+	if err != nil {
+		return protocol.MakeErrReply(err.Error())
+	}
+
+	count := sortedSet.RangeCount(min, max)
+
+	return protocol.MakeIntReply(count)
+}
+
+func execZRangeByLex(db *DB, args [][]byte) redis.Reply {
+	n := len(args)
+	if n > 3 && strings.ToLower(string(args[3])) != "limit" {
+		return protocol.MakeErrReply("ERR syntax error")
+	}
+	if n != 3 && n != 6 {
+		return protocol.MakeErrReply("ERR wrong number of arguments for 'zrangebylex' command")
+	}
+
+	key := string(args[0])
+	sortedSet, errReply := db.getAsSortedSet(key)
+	if errReply != nil {
+		return errReply
+	}
+	if sortedSet == nil {
+		return protocol.MakeIntReply(0)
+	}
+
+	minEle, maxEle := string(args[1]), string(args[2])
+	min, err := SortedSet.ParseLexBorder(minEle)
+	if err != nil {
+		return protocol.MakeErrReply(err.Error())
+	}
+	max, err := SortedSet.ParseLexBorder(maxEle)
+	if err != nil {
+		return protocol.MakeErrReply(err.Error())
+	}
+
+	offset := int64(0)
+	limitCnt := int64(math.MaxInt64)
+	if n > 3 {
+		var err error
+		offset, err = strconv.ParseInt(string(args[4]), 10, 64)
+		if err != nil {
+			return protocol.MakeErrReply("ERR value is not an integer or out of range")
+		}
+		if offset < 0 {
+			return protocol.MakeEmptyMultiBulkReply()
+		}
+		count, err := strconv.ParseInt(string(args[5]), 10, 64)
+		if err != nil {
+			return protocol.MakeErrReply("ERR value is not an integer or out of range")
+		}
+		if count >= 0 {
+			limitCnt = count
+		}
+	}
+
+	elements := sortedSet.Range(min, max, offset, limitCnt, false)
+	result := make([][]byte, 0, len(elements))
+	for _, ele := range elements {
+		result = append(result, []byte(ele.Member))
+	}
+	if len(result) == 0 {
+		return protocol.MakeEmptyMultiBulkReply()
+	}
+	return protocol.MakeMultiBulkReply(result)
+}
+
+func execZRemRangeByLex(db *DB, args [][]byte) redis.Reply {
+	n := len(args)
+	if n != 3 {
+		return protocol.MakeErrReply("ERR wrong number of arguments for 'zremrangebylex' command")
+	}
+
+	key := string(args[0])
+	sortedSet, errReply := db.getAsSortedSet(key)
+	if errReply != nil {
+		return errReply
+	}
+	if sortedSet == nil {
+		return protocol.MakeIntReply(0)
+	}
+
+	minEle, maxEle := string(args[1]), string(args[2])
+	min, err := SortedSet.ParseLexBorder(minEle)
+	if err != nil {
+		return protocol.MakeErrReply(err.Error())
+	}
+	max, err := SortedSet.ParseLexBorder(maxEle)
+	if err != nil {
+		return protocol.MakeErrReply(err.Error())
+	}
+
+	count := sortedSet.RemoveRange(min, max)
+
+	return protocol.MakeIntReply(count)
+}
+
+func execZRevRangeByLex(db *DB, args [][]byte) redis.Reply {
+	n := len(args)
+	if n > 3 && strings.ToLower(string(args[3])) != "limit" {
+		return protocol.MakeErrReply("ERR syntax error")
+	}
+	if n != 3 && n != 6 {
+		return protocol.MakeErrReply("ERR wrong number of arguments for 'zrangebylex' command")
+	}
+
+	key := string(args[0])
+	sortedSet, errReply := db.getAsSortedSet(key)
+	if errReply != nil {
+		return errReply
+	}
+	if sortedSet == nil {
+		return protocol.MakeIntReply(0)
+	}
+
+	minEle, maxEle := string(args[2]), string(args[1])
+	min, err := SortedSet.ParseLexBorder(minEle)
+	if err != nil {
+		return protocol.MakeErrReply(err.Error())
+	}
+	max, err := SortedSet.ParseLexBorder(maxEle)
+	if err != nil {
+		return protocol.MakeErrReply(err.Error())
+	}
+
+	offset := int64(0)
+	limitCnt := int64(math.MaxInt64)
+	if n > 3 {
+		var err error
+		offset, err = strconv.ParseInt(string(args[4]), 10, 64)
+		if err != nil {
+			return protocol.MakeErrReply("ERR value is not an integer or out of range")
+		}
+		if offset < 0 {
+			return protocol.MakeEmptyMultiBulkReply()
+		}
+		count, err := strconv.ParseInt(string(args[5]), 10, 64)
+		if err != nil {
+			return protocol.MakeErrReply("ERR value is not an integer or out of range")
+		}
+		if count >= 0 {
+			limitCnt = count
+		}
+	}
+
+	elements := sortedSet.Range(min, max, offset, limitCnt, true)
+	result := make([][]byte, 0, len(elements))
+	for _, ele := range elements {
+		result = append(result, []byte(ele.Member))
+	}
+	if len(result) == 0 {
+		return protocol.MakeEmptyMultiBulkReply()
+	}
+	return protocol.MakeMultiBulkReply(result)
+}
+
 func init() {
-	RegisterCommand("ZAdd", execZAdd, writeFirstKey, undoZAdd, -4)
-	RegisterCommand("ZScore", execZScore, readFirstKey, nil, 3)
-	RegisterCommand("ZIncrBy", execZIncrBy, writeFirstKey, undoZIncr, 4)
-	RegisterCommand("ZRank", execZRank, readFirstKey, nil, 3)
-	RegisterCommand("ZCount", execZCount, readFirstKey, nil, 4)
-	RegisterCommand("ZRevRank", execZRevRank, readFirstKey, nil, 3)
-	RegisterCommand("ZCard", execZCard, readFirstKey, nil, 2)
-	RegisterCommand("ZRange", execZRange, readFirstKey, nil, -4)
-	RegisterCommand("ZRangeByScore", execZRangeByScore, readFirstKey, nil, -4)
-	RegisterCommand("ZRange", execZRange, readFirstKey, nil, -4)
-	RegisterCommand("ZRevRange", execZRevRange, readFirstKey, nil, -4)
-	RegisterCommand("ZRangeByScore", execZRangeByScore, readFirstKey, nil, -4)
-	RegisterCommand("ZRevRangeByScore", execZRevRangeByScore, readFirstKey, nil, -4)
-	RegisterCommand("ZRem", execZRem, writeFirstKey, undoZRem, -3)
-	RegisterCommand("ZRemRangeByScore", execZRemRangeByScore, writeFirstKey, rollbackFirstKey, 4)
-	RegisterCommand("ZRemRangeByRank", execZRemRangeByRank, writeFirstKey, rollbackFirstKey, 4)
+	registerCommand("ZAdd", execZAdd, writeFirstKey, undoZAdd, -4, flagWrite).
+		attachCommandExtra([]string{redisFlagWrite, redisFlagDenyOOM, redisFlagFast}, 1, 1, 1)
+	registerCommand("ZScore", execZScore, readFirstKey, nil, 3, flagReadOnly).
+		attachCommandExtra([]string{redisFlagReadonly, redisFlagFast}, 1, 1, 1)
+	registerCommand("ZIncrBy", execZIncrBy, writeFirstKey, undoZIncr, 4, flagWrite).
+		attachCommandExtra([]string{redisFlagWrite, redisFlagDenyOOM, redisFlagFast}, 1, 1, 1)
+	registerCommand("ZRank", execZRank, readFirstKey, nil, 3, flagReadOnly).
+		attachCommandExtra([]string{redisFlagReadonly, redisFlagFast}, 1, 1, 1)
+	registerCommand("ZCount", execZCount, readFirstKey, nil, 4, flagReadOnly).
+		attachCommandExtra([]string{redisFlagReadonly, redisFlagFast}, 1, 1, 1)
+	registerCommand("ZRevRank", execZRevRank, readFirstKey, nil, 3, flagReadOnly).
+		attachCommandExtra([]string{redisFlagReadonly, redisFlagFast}, 1, 1, 1)
+	registerCommand("ZCard", execZCard, readFirstKey, nil, 2, flagReadOnly).
+		attachCommandExtra([]string{redisFlagReadonly, redisFlagFast}, 1, 1, 1)
+	registerCommand("ZRange", execZRange, readFirstKey, nil, -4, flagReadOnly).
+		attachCommandExtra([]string{redisFlagReadonly}, 1, 1, 1)
+	registerCommand("ZRangeByScore", execZRangeByScore, readFirstKey, nil, -4, flagReadOnly).
+		attachCommandExtra([]string{redisFlagReadonly}, 1, 1, 1)
+	registerCommand("ZRevRange", execZRevRange, readFirstKey, nil, -4, flagReadOnly).
+		attachCommandExtra([]string{redisFlagReadonly}, 1, 1, 1)
+	registerCommand("ZRevRangeByScore", execZRevRangeByScore, readFirstKey, nil, -4, flagReadOnly).
+		attachCommandExtra([]string{redisFlagReadonly}, 1, 1, 1)
+	registerCommand("ZPopMin", execZPopMin, writeFirstKey, rollbackFirstKey, -2, flagWrite).
+		attachCommandExtra([]string{redisFlagWrite, redisFlagFast}, 1, 1, 1)
+	registerCommand("ZRem", execZRem, writeFirstKey, undoZRem, -3, flagWrite).
+		attachCommandExtra([]string{redisFlagWrite, redisFlagFast}, 1, 1, 1)
+	registerCommand("ZRemRangeByScore", execZRemRangeByScore, writeFirstKey, rollbackFirstKey, 4, flagWrite).
+		attachCommandExtra([]string{redisFlagWrite}, 1, 1, 1)
+	registerCommand("ZRemRangeByRank", execZRemRangeByRank, writeFirstKey, rollbackFirstKey, 4, flagWrite).
+		attachCommandExtra([]string{redisFlagWrite}, 1, 1, 1)
+	registerCommand("ZLexCount", execZLexCount, readFirstKey, nil, 4, flagReadOnly).
+		attachCommandExtra([]string{redisFlagReadonly}, 1, 1, 1)
+	registerCommand("ZRangeByLex", execZRangeByLex, readFirstKey, nil, -4, flagReadOnly).
+		attachCommandExtra([]string{redisFlagReadonly}, 1, 1, 1)
+	registerCommand("ZRemRangeByLex", execZRemRangeByLex, writeFirstKey, rollbackFirstKey, 4, flagWrite).
+		attachCommandExtra([]string{redisFlagWrite}, 1, 1, 1)
+	registerCommand("ZRevRangeByLex", execZRevRangeByLex, readFirstKey, nil, -4, flagReadOnly).
+		attachCommandExtra([]string{redisFlagReadonly}, 1, 1, 1)
 }

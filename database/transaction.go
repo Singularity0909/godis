@@ -1,15 +1,9 @@
 package database
 
 import (
-	"github.com/hdt3213/godis/datastruct/set"
 	"github.com/hdt3213/godis/interface/redis"
 	"github.com/hdt3213/godis/redis/protocol"
 	"strings"
-)
-
-var forbiddenInMulti = set.Make(
-	"flushdb",
-	"flushall",
 )
 
 // Watch set watching keys
@@ -29,7 +23,7 @@ func execGetVersion(db *DB, args [][]byte) redis.Reply {
 }
 
 func init() {
-	RegisterCommand("GetVer", execGetVersion, readAllKeys, nil, 2)
+	registerCommand("GetVer", execGetVersion, readAllKeys, nil, 2, flagReadOnly)
 }
 
 // invoker should lock watching keys
@@ -57,17 +51,19 @@ func EnqueueCmd(conn redis.Connection, cmdLine [][]byte) redis.Reply {
 	cmdName := strings.ToLower(string(cmdLine[0]))
 	cmd, ok := cmdTable[cmdName]
 	if !ok {
-		return protocol.MakeErrReply("ERR unknown command '" + cmdName + "'")
-	}
-	if forbiddenInMulti.Has(cmdName) {
-		return protocol.MakeErrReply("ERR command '" + cmdName + "' cannot be used in MULTI")
+		err := protocol.MakeErrReply("ERR unknown command '" + cmdName + "'")
+		conn.AddTxError(err)
+		return err
 	}
 	if cmd.prepare == nil {
-		return protocol.MakeErrReply("ERR command '" + cmdName + "' cannot be used in MULTI")
+		err := protocol.MakeErrReply("ERR command '" + cmdName + "' cannot be used in MULTI")
+		conn.AddTxError(err)
+		return err
 	}
 	if !validateArity(cmd.arity, cmdLine) {
-		// difference with redis: we won't enqueue command line with wrong arity
-		return protocol.MakeArgNumErrReply(cmdName)
+		err := protocol.MakeArgNumErrReply(cmdName)
+		conn.AddTxError(err)
+		return err
 	}
 	conn.EnqueueCmd(cmdLine)
 	return protocol.MakeQueuedReply()
@@ -78,6 +74,9 @@ func execMulti(db *DB, conn redis.Connection) redis.Reply {
 		return protocol.MakeErrReply("ERR EXEC without MULTI")
 	}
 	defer conn.SetMultiState(false)
+	if len(conn.GetTxErrors()) > 0 {
+		return protocol.MakeErrReply("EXECABORT Transaction discarded because of previous errors.")
+	}
 	cmdLines := conn.GetQueuedCmdLine()
 	return db.ExecMulti(conn, conn.GetWatching(), cmdLines)
 }

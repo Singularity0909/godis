@@ -39,7 +39,7 @@ func (locks *Locks) spread(hashCode uint32) uint32 {
 		panic("dict is nil")
 	}
 	tableSize := uint32(len(locks.table))
-	return (tableSize - 1) & uint32(hashCode)
+	return (tableSize - 1) & hashCode
 }
 
 // Lock obtains exclusive lock for writing
@@ -71,10 +71,10 @@ func (locks *Locks) RUnLock(key string) {
 }
 
 func (locks *Locks) toLockIndices(keys []string, reverse bool) []uint32 {
-	indexMap := make(map[uint32]bool)
+	indexMap := make(map[uint32]struct{})
 	for _, key := range keys {
 		index := locks.spread(fnv32(key))
-		indexMap[index] = true
+		indexMap[index] = struct{}{}
 	}
 	indices := make([]uint32, 0, len(indexMap))
 	for index := range indexMap {
@@ -90,7 +90,7 @@ func (locks *Locks) toLockIndices(keys []string, reverse bool) []uint32 {
 }
 
 // Locks obtains multiple exclusive locks for writing
-// invoking Lock in loop may cause dead lock, please use Locks
+// invoking Lock in loop may cause deadlock, please use Locks
 func (locks *Locks) Locks(keys ...string) {
 	indices := locks.toLockIndices(keys, false)
 	for _, index := range indices {
@@ -100,7 +100,7 @@ func (locks *Locks) Locks(keys ...string) {
 }
 
 // RLocks obtains multiple shared locks for reading
-// invoking RLock in loop may cause dead lock, please use RLocks
+// invoking RLock in loop may cause deadlock, please use RLocks
 func (locks *Locks) RLocks(keys ...string) {
 	indices := locks.toLockIndices(keys, false)
 	for _, index := range indices {
@@ -131,9 +131,9 @@ func (locks *Locks) RUnLocks(keys ...string) {
 func (locks *Locks) RWLocks(writeKeys []string, readKeys []string) {
 	keys := append(writeKeys, readKeys...)
 	indices := locks.toLockIndices(keys, false)
-	writeIndices := locks.toLockIndices(writeKeys, false)
 	writeIndexSet := make(map[uint32]struct{})
-	for _, idx := range writeIndices {
+	for _, wKey := range writeKeys {
+		idx := locks.spread(fnv32(wKey))
 		writeIndexSet[idx] = struct{}{}
 	}
 	for _, index := range indices {
@@ -151,9 +151,9 @@ func (locks *Locks) RWLocks(writeKeys []string, readKeys []string) {
 func (locks *Locks) RWUnLocks(writeKeys []string, readKeys []string) {
 	keys := append(writeKeys, readKeys...)
 	indices := locks.toLockIndices(keys, true)
-	writeIndices := locks.toLockIndices(writeKeys, true)
 	writeIndexSet := make(map[uint32]struct{})
-	for _, idx := range writeIndices {
+	for _, wKey := range writeKeys {
+		idx := locks.spread(fnv32(wKey))
 		writeIndexSet[idx] = struct{}{}
 	}
 	for _, index := range indices {

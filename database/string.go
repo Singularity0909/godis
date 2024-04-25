@@ -1,17 +1,17 @@
 package database
 
 import (
+	"math/bits"
+	"strconv"
+	"strings"
+	"time"
+
 	"github.com/hdt3213/godis/aof"
 	"github.com/hdt3213/godis/datastruct/bitmap"
 	"github.com/hdt3213/godis/interface/database"
 	"github.com/hdt3213/godis/interface/redis"
 	"github.com/hdt3213/godis/lib/utils"
 	"github.com/hdt3213/godis/redis/protocol"
-	"github.com/shopspring/decimal"
-	"math/bits"
-	"strconv"
-	"strings"
-	"time"
 )
 
 func (db *DB) getAsString(key string) ([]byte, protocol.ErrorReply) {
@@ -46,6 +46,78 @@ const (
 )
 
 const unlimitedTTL int64 = 0
+
+// execGetEX Get the value of key and optionally set its expiration
+func execGetEX(db *DB, args [][]byte) redis.Reply {
+	key := string(args[0])
+	bytes, err := db.getAsString(key)
+	ttl := unlimitedTTL
+	if err != nil {
+		return err
+	}
+	if bytes == nil {
+		return &protocol.NullBulkReply{}
+	}
+
+	for i := 1; i < len(args); i++ {
+		arg := strings.ToUpper(string(args[i]))
+		if arg == "EX" { // ttl in seconds
+			if ttl != unlimitedTTL {
+				// ttl has been set
+				return &protocol.SyntaxErrReply{}
+			}
+			if i+1 >= len(args) {
+				return &protocol.SyntaxErrReply{}
+			}
+			ttlArg, err := strconv.ParseInt(string(args[i+1]), 10, 64)
+			if err != nil {
+				return &protocol.SyntaxErrReply{}
+			}
+			if ttlArg <= 0 {
+				return protocol.MakeErrReply("ERR invalid expire time in getex")
+			}
+			ttl = ttlArg * 1000
+			i++ // skip next arg
+		} else if arg == "PX" { // ttl in milliseconds
+			if ttl != unlimitedTTL {
+				return &protocol.SyntaxErrReply{}
+			}
+			if i+1 >= len(args) {
+				return &protocol.SyntaxErrReply{}
+			}
+			ttlArg, err := strconv.ParseInt(string(args[i+1]), 10, 64)
+			if err != nil {
+				return &protocol.SyntaxErrReply{}
+			}
+			if ttlArg <= 0 {
+				return protocol.MakeErrReply("ERR invalid expire time in getex")
+			}
+			ttl = ttlArg
+			i++ // skip next arg
+		} else if arg == "PERSIST" {
+			if ttl != unlimitedTTL { // PERSIST Cannot be used with EX | PX
+				return &protocol.SyntaxErrReply{}
+			}
+			if i+1 > len(args) {
+				return &protocol.SyntaxErrReply{}
+			}
+			db.Persist(key)
+		}
+	}
+
+	if len(args) > 1 {
+		if ttl != unlimitedTTL { // EX | PX
+			expireTime := time.Now().Add(time.Duration(ttl) * time.Millisecond)
+			db.Expire(key, expireTime)
+			db.addAof(aof.MakeExpireCmd(key, expireTime).Args)
+		} else { // PERSIST
+			db.Persist(key) // override ttl
+			// we convert to persist command to write aof
+			db.addAof(utils.ToCmdLine3("persist", args[0]))
+		}
+	}
+	return protocol.MakeBulkReply(bytes)
+}
 
 // execSet sets string value and time to live to the given key
 func execSet(db *DB, args [][]byte) redis.Reply {
@@ -317,10 +389,28 @@ func execGetSet(db *DB, args [][]byte) redis.Reply {
 
 	db.PutEntity(key, &database.DataEntity{Data: value})
 	db.Persist(key) // override ttl
-	db.addAof(utils.ToCmdLine3("getset", args...))
+	db.addAof(utils.ToCmdLine3("set", args...))
 	if old == nil {
 		return new(protocol.NullBulkReply)
 	}
+	return protocol.MakeBulkReply(old)
+}
+
+// execGetDel Get the value of key and delete the key.
+func execGetDel(db *DB, args [][]byte) redis.Reply {
+	key := string(args[0])
+
+	old, err := db.getAsString(key)
+	if err != nil {
+		return err
+	}
+	if old == nil {
+		return new(protocol.NullBulkReply)
+	}
+	db.Remove(key)
+
+	// We convert to del command to write aof
+	db.addAof(utils.ToCmdLine3("del", args...))
 	return protocol.MakeBulkReply(old)
 }
 
@@ -386,7 +476,7 @@ func execIncrBy(db *DB, args [][]byte) redis.Reply {
 func execIncrByFloat(db *DB, args [][]byte) redis.Reply {
 	key := string(args[0])
 	rawDelta := string(args[1])
-	delta, err := decimal.NewFromString(rawDelta)
+	delta, err := strconv.ParseFloat(rawDelta, 64)
 	if err != nil {
 		return protocol.MakeErrReply("ERR value is not a valid float")
 	}
@@ -396,11 +486,11 @@ func execIncrByFloat(db *DB, args [][]byte) redis.Reply {
 		return errReply
 	}
 	if bytes != nil {
-		val, err := decimal.NewFromString(string(bytes))
+		val, err := strconv.ParseFloat(string(bytes), 64)
 		if err != nil {
 			return protocol.MakeErrReply("ERR value is not a valid float")
 		}
-		resultBytes := []byte(val.Add(delta).String())
+		resultBytes := []byte(strconv.FormatFloat(val+delta, 'f', -1, 64))
 		db.PutEntity(key, &database.DataEntity{
 			Data: resultBytes,
 		})
@@ -585,6 +675,7 @@ func execSetBit(db *DB, args [][]byte) redis.Reply {
 	former := bm.GetBit(offset)
 	bm.SetBit(offset, v)
 	db.PutEntity(key, &database.DataEntity{Data: bm.ToBytes()})
+	db.addAof(utils.ToCmdLine3("setBit", args...))
 	return protocol.MakeIntReply(int64(former))
 }
 
@@ -734,28 +825,64 @@ func execBitPos(db *DB, args [][]byte) redis.Reply {
 	return protocol.MakeIntReply(offset)
 }
 
-func init() {
-	RegisterCommand("Set", execSet, writeFirstKey, rollbackFirstKey, -3)
-	RegisterCommand("SetNx", execSetNX, writeFirstKey, rollbackFirstKey, 3)
-	RegisterCommand("SetEX", execSetEX, writeFirstKey, rollbackFirstKey, 4)
-	RegisterCommand("PSetEX", execPSetEX, writeFirstKey, rollbackFirstKey, 4)
-	RegisterCommand("MSet", execMSet, prepareMSet, undoMSet, -3)
-	RegisterCommand("MGet", execMGet, prepareMGet, nil, -2)
-	RegisterCommand("MSetNX", execMSetNX, prepareMSet, undoMSet, -3)
-	RegisterCommand("Get", execGet, readFirstKey, nil, 2)
-	RegisterCommand("GetSet", execGetSet, writeFirstKey, rollbackFirstKey, 3)
-	RegisterCommand("Incr", execIncr, writeFirstKey, rollbackFirstKey, 2)
-	RegisterCommand("IncrBy", execIncrBy, writeFirstKey, rollbackFirstKey, 3)
-	RegisterCommand("IncrByFloat", execIncrByFloat, writeFirstKey, rollbackFirstKey, 3)
-	RegisterCommand("Decr", execDecr, writeFirstKey, rollbackFirstKey, 2)
-	RegisterCommand("DecrBy", execDecrBy, writeFirstKey, rollbackFirstKey, 3)
-	RegisterCommand("StrLen", execStrLen, readFirstKey, nil, 2)
-	RegisterCommand("Append", execAppend, writeFirstKey, rollbackFirstKey, 3)
-	RegisterCommand("SetRange", execSetRange, writeFirstKey, rollbackFirstKey, 4)
-	RegisterCommand("GetRange", execGetRange, readFirstKey, nil, 4)
-	RegisterCommand("SetBit", execSetBit, writeFirstKey, rollbackFirstKey, 4)
-	RegisterCommand("GetBit", execGetBit, readFirstKey, nil, 3)
-	RegisterCommand("BitCount", execBitCount, readFirstKey, nil, -2)
-	RegisterCommand("BitPos", execBitPos, readFirstKey, nil, -3)
+// GetRandomKey Randomly return (do not delete) a key from the godis
+func getRandomKey(db *DB, args [][]byte) redis.Reply {
+	k := db.data.RandomKeys(1)
+	if len(k) == 0 {
+		return &protocol.NullBulkReply{}
+	}
+	var key []byte
+	return protocol.MakeBulkReply(strconv.AppendQuote(key, k[0]))
+}
 
+func init() {
+	registerCommand("Set", execSet, writeFirstKey, rollbackFirstKey, -3, flagWrite).
+		attachCommandExtra([]string{redisFlagWrite, redisFlagDenyOOM}, 1, 1, 1)
+	registerCommand("SetNx", execSetNX, writeFirstKey, rollbackFirstKey, 3, flagWrite).
+		attachCommandExtra([]string{redisFlagWrite, redisFlagDenyOOM, redisFlagFast}, 1, 1, 1)
+	registerCommand("SetEX", execSetEX, writeFirstKey, rollbackFirstKey, 4, flagWrite).
+		attachCommandExtra([]string{redisFlagWrite, redisFlagDenyOOM}, 1, 1, 1)
+	registerCommand("PSetEX", execPSetEX, writeFirstKey, rollbackFirstKey, 4, flagWrite).
+		attachCommandExtra([]string{redisFlagWrite, redisFlagDenyOOM}, 1, 1, 1)
+	registerCommand("MSet", execMSet, prepareMSet, undoMSet, -3, flagWrite).
+		attachCommandExtra([]string{redisFlagWrite, redisFlagDenyOOM}, 1, -1, 2)
+	registerCommand("MGet", execMGet, prepareMGet, nil, -2, flagReadOnly).
+		attachCommandExtra([]string{redisFlagReadonly, redisFlagFast}, 1, 1, 1)
+	registerCommand("MSetNX", execMSetNX, prepareMSet, undoMSet, -3, flagWrite).
+		attachCommandExtra([]string{redisFlagWrite, redisFlagDenyOOM}, 1, 1, 1)
+	registerCommand("Get", execGet, readFirstKey, nil, 2, flagReadOnly).
+		attachCommandExtra([]string{redisFlagReadonly, redisFlagFast}, 1, 1, 1)
+	registerCommand("GetEX", execGetEX, writeFirstKey, rollbackFirstKey, -2, flagReadOnly).
+		attachCommandExtra([]string{redisFlagReadonly, redisFlagFast}, 1, 1, 1)
+	registerCommand("GetSet", execGetSet, writeFirstKey, rollbackFirstKey, 3, flagWrite).
+		attachCommandExtra([]string{redisFlagWrite, redisFlagDenyOOM}, 1, 1, 1)
+	registerCommand("GetDel", execGetDel, writeFirstKey, rollbackFirstKey, 2, flagWrite).
+		attachCommandExtra([]string{redisFlagWrite, redisFlagDenyOOM}, 1, 1, 1)
+	registerCommand("Incr", execIncr, writeFirstKey, rollbackFirstKey, 2, flagWrite).
+		attachCommandExtra([]string{redisFlagWrite, redisFlagDenyOOM, redisFlagFast}, 1, 1, 1)
+	registerCommand("IncrBy", execIncrBy, writeFirstKey, rollbackFirstKey, 3, flagWrite).
+		attachCommandExtra([]string{redisFlagWrite, redisFlagDenyOOM}, 1, 1, 1)
+	registerCommand("IncrByFloat", execIncrByFloat, writeFirstKey, rollbackFirstKey, 3, flagWrite).attachCommandExtra([]string{redisFlagWrite, redisFlagDenyOOM}, 1, 1, 1)
+	registerCommand("Decr", execDecr, writeFirstKey, rollbackFirstKey, 2, flagWrite).
+		attachCommandExtra([]string{redisFlagWrite, redisFlagDenyOOM}, 1, 1, 1)
+	registerCommand("DecrBy", execDecrBy, writeFirstKey, rollbackFirstKey, 3, flagWrite).
+		attachCommandExtra([]string{redisFlagWrite, redisFlagDenyOOM}, 1, 1, 1)
+	registerCommand("StrLen", execStrLen, readFirstKey, nil, 2, flagReadOnly).
+		attachCommandExtra([]string{redisFlagReadonly, redisFlagFast}, 1, 1, 1)
+	registerCommand("Append", execAppend, writeFirstKey, rollbackFirstKey, 3, flagWrite).
+		attachCommandExtra([]string{redisFlagWrite, redisFlagDenyOOM}, 1, 1, 1)
+	registerCommand("SetRange", execSetRange, writeFirstKey, rollbackFirstKey, 4, flagWrite).
+		attachCommandExtra([]string{redisFlagWrite, redisFlagDenyOOM}, 1, 1, 1)
+	registerCommand("GetRange", execGetRange, readFirstKey, nil, 4, flagReadOnly).
+		attachCommandExtra([]string{redisFlagReadonly}, 1, 1, 1)
+	registerCommand("SetBit", execSetBit, writeFirstKey, rollbackFirstKey, 4, flagWrite).
+		attachCommandExtra([]string{redisFlagWrite, redisFlagDenyOOM}, 1, 1, 1)
+	registerCommand("GetBit", execGetBit, readFirstKey, nil, 3, flagReadOnly).
+		attachCommandExtra([]string{redisFlagReadonly, redisFlagFast}, 1, 1, 1)
+	registerCommand("BitCount", execBitCount, readFirstKey, nil, -2, flagReadOnly).
+		attachCommandExtra([]string{redisFlagReadonly}, 1, 1, 1)
+	registerCommand("BitPos", execBitPos, readFirstKey, nil, -3, flagReadOnly).
+		attachCommandExtra([]string{redisFlagReadonly}, 1, 1, 1)
+	registerCommand("Randomkey", getRandomKey, readAllKeys, nil, 1, flagReadOnly).
+		attachCommandExtra([]string{redisFlagReadonly, redisFlagRandom}, 1, 1, 1)
 }

@@ -46,7 +46,7 @@ func (dict *SimpleDict) PutIfAbsent(key string, val interface{}) (result int) {
 	return 1
 }
 
-// PutIfExists puts value if the key is exist and returns the number of inserted key-value
+// PutIfExists puts value if the key is existed and returns the number of inserted key-value
 func (dict *SimpleDict) PutIfExists(key string, val interface{}) (result int) {
 	_, existed := dict.m[key]
 	if existed {
@@ -57,13 +57,13 @@ func (dict *SimpleDict) PutIfExists(key string, val interface{}) (result int) {
 }
 
 // Remove removes the key and return the number of deleted key-value
-func (dict *SimpleDict) Remove(key string) (result int) {
-	_, existed := dict.m[key]
+func (dict *SimpleDict) Remove(key string) (val interface{}, result int) {
+	val, existed := dict.m[key]
 	delete(dict.m, key)
 	if existed {
-		return 1
+		return val, 1
 	}
-	return 0
+	return nil, 0
 }
 
 // Keys returns all keys in dict
@@ -72,6 +72,7 @@ func (dict *SimpleDict) Keys() []string {
 	i := 0
 	for k := range dict.m {
 		result[i] = k
+		i++
 	}
 	return result
 }
@@ -106,7 +107,7 @@ func (dict *SimpleDict) RandomDistinctKeys(limit int) []string {
 	result := make([]string, size)
 	i := 0
 	for k := range dict.m {
-		if i == limit {
+		if i == size {
 			break
 		}
 		result[i] = k

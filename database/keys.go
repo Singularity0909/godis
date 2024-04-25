@@ -10,7 +10,9 @@ import (
 	"github.com/hdt3213/godis/lib/utils"
 	"github.com/hdt3213/godis/lib/wildcard"
 	"github.com/hdt3213/godis/redis/protocol"
+	"math"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -50,6 +52,7 @@ func execExists(db *DB, args [][]byte) redis.Reply {
 }
 
 // execFlushDB removes all data in current db
+// deprecated, use Server.flushDB
 func execFlushDB(db *DB, args [][]byte) redis.Reply {
 	db.Flush()
 	db.addAof(utils.ToCmdLine3("flushdb", args...))
@@ -66,7 +69,7 @@ func execType(db *DB, args [][]byte) redis.Reply {
 	switch entity.Data.(type) {
 	case []byte:
 		return protocol.MakeStatusReply("string")
-	case *list.LinkedList:
+	case list.List:
 		return protocol.MakeStatusReply("list")
 	case dict.Dict:
 		return protocol.MakeStatusReply("hash")
@@ -183,6 +186,23 @@ func execExpireAt(db *DB, args [][]byte) redis.Reply {
 	return protocol.MakeIntReply(1)
 }
 
+// execExpireTime returns the absolute Unix expiration timestamp in seconds at which the given key will expire.
+func execExpireTime(db *DB, args [][]byte) redis.Reply {
+	key := string(args[0])
+	_, exists := db.GetEntity(key)
+	if !exists {
+		return protocol.MakeIntReply(-2)
+	}
+
+	raw, exists := db.ttlMap.Get(key)
+	if !exists {
+		return protocol.MakeIntReply(-1)
+	}
+	rawExpireTime, _ := raw.(time.Time)
+	expireTime := rawExpireTime.Unix()
+	return protocol.MakeIntReply(expireTime)
+}
+
 // execPExpire sets a key's time to live in milliseconds
 func execPExpire(db *DB, args [][]byte) redis.Reply {
 	key := string(args[0])
@@ -225,6 +245,23 @@ func execPExpireAt(db *DB, args [][]byte) redis.Reply {
 	return protocol.MakeIntReply(1)
 }
 
+// execPExpireTime returns the absolute Unix expiration timestamp in milliseconds at which the given key will expire.
+func execPExpireTime(db *DB, args [][]byte) redis.Reply {
+	key := string(args[0])
+	_, exists := db.GetEntity(key)
+	if !exists {
+		return protocol.MakeIntReply(-2)
+	}
+
+	raw, exists := db.ttlMap.Get(key)
+	if !exists {
+		return protocol.MakeIntReply(-1)
+	}
+	rawExpireTime, _ := raw.(time.Time)
+	expireTime := rawExpireTime.UnixMilli()
+	return protocol.MakeIntReply(expireTime)
+}
+
 // execTTL returns a key's time to live in seconds
 func execTTL(db *DB, args [][]byte) redis.Reply {
 	key := string(args[0])
@@ -238,8 +275,8 @@ func execTTL(db *DB, args [][]byte) redis.Reply {
 		return protocol.MakeIntReply(-1)
 	}
 	expireTime, _ := raw.(time.Time)
-	ttl := expireTime.Sub(time.Now())
-	return protocol.MakeIntReply(int64(ttl / time.Second))
+	ttl := expireTime.Sub(time.Now()).Seconds()
+	return protocol.MakeIntReply(int64(math.Round(ttl)))
 }
 
 // execPTTL returns a key's time to live in milliseconds
@@ -255,8 +292,8 @@ func execPTTL(db *DB, args [][]byte) redis.Reply {
 		return protocol.MakeIntReply(-1)
 	}
 	expireTime, _ := raw.(time.Time)
-	ttl := expireTime.Sub(time.Now())
-	return protocol.MakeIntReply(int64(ttl / time.Millisecond))
+	ttl := expireTime.Sub(time.Now()).Milliseconds()
+	return protocol.MakeIntReply(int64(math.Round(float64(ttl))))
 }
 
 // execPersist removes expiration from a key
@@ -279,10 +316,16 @@ func execPersist(db *DB, args [][]byte) redis.Reply {
 
 // execKeys returns all keys matching the given pattern
 func execKeys(db *DB, args [][]byte) redis.Reply {
-	pattern := wildcard.CompilePattern(string(args[0]))
+	pattern, err := wildcard.CompilePattern(string(args[0]))
+	if err != nil {
+		return protocol.MakeErrReply("ERR illegal wildcard")
+	}
 	result := make([][]byte, 0)
 	db.data.ForEach(func(key string, val interface{}) bool {
-		if pattern.IsMatch(key) {
+		if !pattern.IsMatch(key) {
+			return true
+		}
+		if !db.IsExpired(key) {
 			result = append(result, []byte(key))
 		}
 		return true
@@ -293,7 +336,7 @@ func execKeys(db *DB, args [][]byte) redis.Reply {
 func toTTLCmd(db *DB, key string) *protocol.MultiBulkReply {
 	raw, exists := db.ttlMap.Get(key)
 	if !exists {
-		// 无 TTL
+		// has no TTL
 		return protocol.MakeMultiBulkReply(utils.ToCmdLine("PERSIST", key))
 	}
 	expireTime, _ := raw.(time.Time)
@@ -308,18 +351,97 @@ func undoExpire(db *DB, args [][]byte) []CmdLine {
 	}
 }
 
+// execCopy usage: COPY source destination [DB destination-db] [REPLACE]
+// This command copies the value stored at the source key to the destination key.
+func execCopy(mdb *Server, conn redis.Connection, args [][]byte) redis.Reply {
+	dbIndex := conn.GetDBIndex()
+	db := mdb.mustSelectDB(dbIndex) // Current DB
+	replaceFlag := false
+	srcKey := string(args[0])
+	destKey := string(args[1])
+
+	// Parse options
+	if len(args) > 2 {
+		for i := 2; i < len(args); i++ {
+			arg := strings.ToLower(string(args[i]))
+			if arg == "db" {
+				if i+1 >= len(args) {
+					return &protocol.SyntaxErrReply{}
+				}
+				idx, err := strconv.Atoi(string(args[i+1]))
+				if err != nil {
+					return &protocol.SyntaxErrReply{}
+				}
+				if idx >= len(mdb.dbSet) || idx < 0 {
+					return protocol.MakeErrReply("ERR DB index is out of range")
+				}
+				dbIndex = idx
+				i++
+			} else if arg == "replace" {
+				replaceFlag = true
+			} else {
+				return &protocol.SyntaxErrReply{}
+			}
+		}
+	}
+
+	if srcKey == destKey && dbIndex == conn.GetDBIndex() {
+		return protocol.MakeErrReply("ERR source and destination objects are the same")
+	}
+
+	// source key does not exist
+	src, exists := db.GetEntity(srcKey)
+	if !exists {
+		return protocol.MakeIntReply(0)
+	}
+
+	destDB := mdb.mustSelectDB(dbIndex)
+	if _, exists = destDB.GetEntity(destKey); exists != false {
+		// If destKey exists and there is no "replace" option
+		if replaceFlag == false {
+			return protocol.MakeIntReply(0)
+		}
+	}
+
+	destDB.PutEntity(destKey, src)
+	raw, exists := db.ttlMap.Get(srcKey)
+	if exists {
+		expire := raw.(time.Time)
+		destDB.Expire(destKey, expire)
+	}
+	mdb.AddAof(conn.GetDBIndex(), utils.ToCmdLine3("copy", args...))
+	return protocol.MakeIntReply(1)
+}
+
 func init() {
-	RegisterCommand("Del", execDel, writeAllKeys, undoDel, -2)
-	RegisterCommand("Expire", execExpire, writeFirstKey, undoExpire, 3)
-	RegisterCommand("ExpireAt", execExpireAt, writeFirstKey, undoExpire, 3)
-	RegisterCommand("PExpire", execPExpire, writeFirstKey, undoExpire, 3)
-	RegisterCommand("PExpireAt", execPExpireAt, writeFirstKey, undoExpire, 3)
-	RegisterCommand("TTL", execTTL, readFirstKey, nil, 2)
-	RegisterCommand("PTTL", execPTTL, readFirstKey, nil, 2)
-	RegisterCommand("Persist", execPersist, writeFirstKey, undoExpire, 2)
-	RegisterCommand("Exists", execExists, readAllKeys, nil, -2)
-	RegisterCommand("Type", execType, readFirstKey, nil, 2)
-	RegisterCommand("Rename", execRename, prepareRename, undoRename, 3)
-	RegisterCommand("RenameNx", execRenameNx, prepareRename, undoRename, 3)
-	RegisterCommand("Keys", execKeys, noPrepare, nil, 2)
+	registerCommand("Del", execDel, writeAllKeys, undoDel, -2, flagWrite).
+		attachCommandExtra([]string{redisFlagWrite}, 1, -1, 1)
+	registerCommand("Expire", execExpire, writeFirstKey, undoExpire, 3, flagWrite).
+		attachCommandExtra([]string{redisFlagWrite, redisFlagFast}, 1, 1, 1)
+	registerCommand("ExpireAt", execExpireAt, writeFirstKey, undoExpire, 3, flagWrite).
+		attachCommandExtra([]string{redisFlagWrite, redisFlagFast}, 1, 1, 1)
+	registerCommand("ExpireTime", execExpireTime, readFirstKey, nil, 2, flagReadOnly).
+		attachCommandExtra([]string{redisFlagWrite, redisFlagFast}, 1, 1, 1)
+	registerCommand("PExpire", execPExpire, writeFirstKey, undoExpire, 3, flagWrite).
+		attachCommandExtra([]string{redisFlagWrite, redisFlagFast}, 1, 1, 1)
+	registerCommand("PExpireAt", execPExpireAt, writeFirstKey, undoExpire, 3, flagWrite).
+		attachCommandExtra([]string{redisFlagWrite, redisFlagFast}, 1, 1, 1)
+	registerCommand("PExpireTime", execPExpireTime, readFirstKey, nil, 2, flagReadOnly).
+		attachCommandExtra([]string{redisFlagWrite, redisFlagFast}, 1, 1, 1)
+	registerCommand("TTL", execTTL, readFirstKey, nil, 2, flagReadOnly).
+		attachCommandExtra([]string{redisFlagReadonly, redisFlagRandom, redisFlagFast}, 1, 1, 1)
+	registerCommand("PTTL", execPTTL, readFirstKey, nil, 2, flagReadOnly).
+		attachCommandExtra([]string{redisFlagReadonly, redisFlagRandom, redisFlagFast}, 1, 1, 1)
+	registerCommand("Persist", execPersist, writeFirstKey, undoExpire, 2, flagWrite).
+		attachCommandExtra([]string{redisFlagWrite, redisFlagFast}, 1, 1, 1)
+	registerCommand("Exists", execExists, readAllKeys, nil, -2, flagReadOnly).
+		attachCommandExtra([]string{redisFlagReadonly, redisFlagFast}, 1, 1, 1)
+	registerCommand("Type", execType, readFirstKey, nil, 2, flagReadOnly).
+		attachCommandExtra([]string{redisFlagReadonly, redisFlagFast}, 1, 1, 1)
+	registerCommand("Rename", execRename, prepareRename, undoRename, 3, flagReadOnly).
+		attachCommandExtra([]string{redisFlagWrite}, 1, 1, 1)
+	registerCommand("RenameNx", execRenameNx, prepareRename, undoRename, 3, flagReadOnly).
+		attachCommandExtra([]string{redisFlagWrite, redisFlagFast}, 1, 1, 1)
+	registerCommand("Keys", execKeys, noPrepare, nil, 2, flagReadOnly).
+		attachCommandExtra([]string{redisFlagReadonly, redisFlagSortForScript}, 1, 1, 1)
 }

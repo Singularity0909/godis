@@ -2,47 +2,88 @@
 package cluster
 
 import (
-	"context"
 	"fmt"
+	"runtime/debug"
+	"strings"
+
+	"github.com/hdt3213/rdb/core"
+
 	"github.com/hdt3213/godis/config"
 	database2 "github.com/hdt3213/godis/database"
 	"github.com/hdt3213/godis/datastruct/dict"
+	"github.com/hdt3213/godis/datastruct/set"
 	"github.com/hdt3213/godis/interface/database"
 	"github.com/hdt3213/godis/interface/redis"
-	"github.com/hdt3213/godis/lib/consistenthash"
 	"github.com/hdt3213/godis/lib/idgenerator"
 	"github.com/hdt3213/godis/lib/logger"
+	"github.com/hdt3213/godis/redis/parser"
 	"github.com/hdt3213/godis/redis/protocol"
-	"github.com/jolestar/go-commons-pool/v2"
-	"runtime/debug"
-	"strings"
+	"os"
+	"path"
+	"sync"
 )
-
-type PeerPicker interface {
-	AddNode(keys ...string)
-	PickNode(key string) string
-}
 
 // Cluster represents a node of godis cluster
 // it holds part of data and coordinates other nodes to finish transactions
 type Cluster struct {
-	self string
+	self          string
+	addr          string
+	db            database.DBEngine
+	transactions  *dict.SimpleDict // id -> Transaction
+	transactionMu sync.RWMutex
+	topology      topology
+	slotMu        sync.RWMutex
+	slots         map[uint32]*hostSlot
+	idGenerator   *idgenerator.IDGenerator
 
-	nodes          []string
-	peerPicker     PeerPicker
-	peerConnection map[string]*pool.ObjectPool
+	clientFactory clientFactory
+}
 
-	db           database.EmbedDB
-	transactions *dict.SimpleDict // id -> Transaction
+type peerClient interface {
+	Send(args [][]byte) redis.Reply
+}
 
-	idGenerator *idgenerator.IDGenerator
-	// use a variable to allow injecting stub for testing
-	relayImpl func(cluster *Cluster, node string, c redis.Connection, cmdLine CmdLine) redis.Reply
+type peerStream interface {
+	Stream() <-chan *parser.Payload
+	Close() error
+}
+
+type clientFactory interface {
+	GetPeerClient(peerAddr string) (peerClient, error)
+	ReturnPeerClient(peerAddr string, peerClient peerClient) error
+	NewStream(peerAddr string, cmdLine CmdLine) (peerStream, error)
+	Close() error
 }
 
 const (
-	replicas = 4
+	slotStateHost = iota
+	slotStateImporting
+	slotStateMovingOut
 )
+
+// hostSlot stores status of host which hosted by current node
+type hostSlot struct {
+	state uint32
+	mu    sync.RWMutex
+	// OldNodeID is the node which is moving out this slot
+	// only valid during slot is importing
+	oldNodeID string
+	// OldNodeID is the node which is importing this slot
+	// only valid during slot is moving out
+	newNodeID string
+
+	/* importedKeys stores imported keys during migrating progress
+	 * While this slot is migrating, if importedKeys does not have the given key, then current node will import key before execute commands
+	 *
+	 * In a migrating slot, the slot on the old node is immutable, we only delete a key in the new node.
+	 * Therefore, we must distinguish between non-migrated key and deleted key.
+	 * Even if a key has been deleted, it still exists in importedKeys, so we can distinguish between non-migrated and deleted.
+	 */
+	importedKeys *set.Set
+	// keys stores all keys in this slot
+	// Cluster.makeInsertCallback and Cluster.makeDeleteCallback will keep keys up to time
+	keys *set.Set
+}
 
 // if only one node involved in a transaction, just execute the command don't apply tcc procedure
 var allowFastTransaction = true
@@ -50,34 +91,29 @@ var allowFastTransaction = true
 // MakeCluster creates and starts a node of cluster
 func MakeCluster() *Cluster {
 	cluster := &Cluster{
-		self: config.Properties.Self,
-
-		db:             database2.NewStandaloneServer(),
-		transactions:   dict.MakeSimple(),
-		peerPicker:     consistenthash.New(replicas, nil),
-		peerConnection: make(map[string]*pool.ObjectPool),
-
-		idGenerator: idgenerator.MakeGenerator(config.Properties.Self),
-		relayImpl:   defaultRelayImpl,
+		self:          config.Properties.Self,
+		addr:          config.Properties.AnnounceAddress(),
+		db:            database2.NewStandaloneServer(),
+		transactions:  dict.MakeSimple(),
+		idGenerator:   idgenerator.MakeGenerator(config.Properties.Self),
+		clientFactory: newDefaultClientFactory(),
 	}
-	contains := make(map[string]struct{})
-	nodes := make([]string, 0, len(config.Properties.Peers)+1)
-	for _, peer := range config.Properties.Peers {
-		if _, ok := contains[peer]; ok {
-			continue
-		}
-		contains[peer] = struct{}{}
-		nodes = append(nodes, peer)
+	topologyPersistFile := path.Join(config.Properties.Dir, config.Properties.ClusterConfigFile)
+	cluster.topology = newRaft(cluster, topologyPersistFile)
+	cluster.db.SetKeyInsertedCallback(cluster.makeInsertCallback())
+	cluster.db.SetKeyDeletedCallback(cluster.makeDeleteCallback())
+	cluster.slots = make(map[uint32]*hostSlot)
+	var err error
+	if topologyPersistFile != "" && fileExists(topologyPersistFile) {
+		err = cluster.LoadConfig()
+	} else if config.Properties.ClusterAsSeed {
+		err = cluster.startAsSeed(config.Properties.AnnounceAddress())
+	} else {
+		err = cluster.Join(config.Properties.ClusterSeed)
 	}
-	nodes = append(nodes, config.Properties.Self)
-	cluster.peerPicker.AddNode(nodes...)
-	ctx := context.Background()
-	for _, peer := range config.Properties.Peers {
-		cluster.peerConnection[peer] = pool.NewObjectPoolWithDefaultConfig(ctx, &connectionFactory{
-			Peer: peer,
-		})
+	if err != nil {
+		panic(err)
 	}
-	cluster.nodes = nodes
 	return cluster
 }
 
@@ -86,10 +122,10 @@ type CmdFunc func(cluster *Cluster, c redis.Connection, cmdLine CmdLine) redis.R
 
 // Close stops current node of cluster
 func (cluster *Cluster) Close() {
+	_ = cluster.topology.Close()
 	cluster.db.Close()
+	cluster.clientFactory.Close()
 }
-
-var router = makeRouter()
 
 func isAuthenticated(c redis.Connection) bool {
 	if config.Properties.RequirePass == "" {
@@ -107,6 +143,11 @@ func (cluster *Cluster) Exec(c redis.Connection, cmdLine [][]byte) (result redis
 		}
 	}()
 	cmdName := strings.ToLower(string(cmdLine[0]))
+	if cmdName == "info" {
+		if ser, ok := cluster.db.(*database2.Server); ok {
+			return database2.Info(ser, cmdLine[1:])
+		}
+	}
 	if cmdName == "auth" {
 		return database2.Auth(c, cmdLine[1:])
 	}
@@ -130,10 +171,7 @@ func (cluster *Cluster) Exec(c redis.Connection, cmdLine [][]byte) (result redis
 		}
 		return execMulti(cluster, c, nil)
 	} else if cmdName == "select" {
-		if len(cmdLine) != 2 {
-			return protocol.MakeArgNumErrReply(cmdName)
-		}
-		return execSelect(c, cmdLine)
+		return protocol.MakeErrReply("select not supported in cluster")
 	}
 	if c != nil && c.InMultiState() {
 		return database2.EnqueueCmd(c, cmdLine)
@@ -149,4 +187,43 @@ func (cluster *Cluster) Exec(c redis.Connection, cmdLine [][]byte) (result redis
 // AfterClientClose does some clean after client close connection
 func (cluster *Cluster) AfterClientClose(c redis.Connection) {
 	cluster.db.AfterClientClose(c)
+}
+
+func (cluster *Cluster) LoadRDB(dec *core.Decoder) error {
+	return cluster.db.LoadRDB(dec)
+}
+
+func (cluster *Cluster) makeInsertCallback() database.KeyEventCallback {
+	return func(dbIndex int, key string, entity *database.DataEntity) {
+		slotId := getSlot(key)
+		cluster.slotMu.RLock()
+		slot, ok := cluster.slots[slotId]
+		cluster.slotMu.RUnlock()
+		// As long as the command is executed, we should update slot.keys regardless of slot.state
+		if ok {
+			slot.mu.Lock()
+			defer slot.mu.Unlock()
+			slot.keys.Add(key)
+		}
+	}
+}
+
+func (cluster *Cluster) makeDeleteCallback() database.KeyEventCallback {
+	return func(dbIndex int, key string, entity *database.DataEntity) {
+		slotId := getSlot(key)
+		cluster.slotMu.RLock()
+		slot, ok := cluster.slots[slotId]
+		cluster.slotMu.RUnlock()
+		// As long as the command is executed, we should update slot.keys regardless of slot.state
+		if ok {
+			slot.mu.Lock()
+			defer slot.mu.Unlock()
+			slot.keys.Remove(key)
+		}
+	}
+}
+
+func fileExists(filename string) bool {
+	info, err := os.Stat(filename)
+	return err == nil && !info.IsDir()
 }
